@@ -22,6 +22,8 @@ import java.io.IOException
 import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
+import java.util.concurrent.atomic.AtomicInteger
+
 import java.util.concurrent.Executors
 import java.util.concurrent.LinkedBlockingQueue
 
@@ -37,6 +39,7 @@ class PaymentExternalSystemAdapterImpl(
         val logger = LoggerFactory.getLogger(PaymentExternalSystemAdapter::class.java)
 
         val mapper = ObjectMapper().registerKotlinModule()
+        const val RETRY_AFTER_MILLIS = 50L
         val json = "application/json".toMediaType()
     }
 
@@ -51,9 +54,30 @@ class PaymentExternalSystemAdapterImpl(
     private val accountName = properties.accountName
     private val requestAverageProcessingTime = properties.averageProcessingTime
     private val rateLimitPerSec = properties.rateLimitPerSec
+    private val submissionRate = (rateLimitPerSec * 9 / 10).coerceAtLeast(1)
     private val parallelRequests = properties.parallelRequests
+    private val pendingPayments = AtomicInteger()
+    private val processingBudgetMillis = requestAverageProcessingTime.toMillis() * 5 / 2
 
-    private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
+    override fun tryReserve(deadline: Long): Long? {
+        val now = now()
+        val maxPending = (deadline - now - processingBudgetMillis) * submissionRate / 1_000
+        if (maxPending <= 0) {
+            pendingPayments.incrementAndGet()
+            return null
+        }
+        while (true) {
+            val pending = pendingPayments.get()
+            if (pending.toLong() >= maxPending) return now + 
+            if (pendingPayments.compareAndSet(pending, pending + 1)) return null
+        }
+    }
+
+    override fun releaseReservation() {
+        pendingPayments.decrementAndGet()
+    }
+
+    private val rateLimiter = SlidingWindowRateLimiter(submissionRate.toLong(), Duration.ofSeconds(1))
 
     private val window = OngoingWindow(parallelRequests)
 

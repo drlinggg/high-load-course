@@ -26,4 +26,8 @@ class PaymentSystemImpl(
             account.performPaymentAsync(paymentId, amount, paymentStartedAt, deadline)
         }
     }
+
+    override fun tryReserve(deadline: Long): Long? = paymentAccounts.first { it.isEnabled() }.tryReserve(deadline)
+
+    override fun releaseReservation() = paymentAccounts.first { it.isEnabled() }.releaseReservation()
 }
