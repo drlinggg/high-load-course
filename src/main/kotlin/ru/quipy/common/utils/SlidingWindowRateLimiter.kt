@@ -9,9 +9,8 @@ import org.slf4j.LoggerFactory
 import java.time.Duration
 import java.util.concurrent.Executors
 import java.util.concurrent.PriorityBlockingQueue
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
-import java.util.concurrent.locks.ReentrantLock
-import kotlin.concurrent.withLock
 
 class SlidingWindowRateLimiter(
     private val rate: Long,
@@ -19,23 +18,42 @@ class SlidingWindowRateLimiter(
 ) : RateLimiter {
     private val rateLimiterScope = CoroutineScope(Executors.newSingleThreadExecutor().asCoroutineDispatcher())
 
-    private val sum = AtomicLong(0)
+    private val count = AtomicLong()
     private val queue = PriorityBlockingQueue<Measure>(10_000)
 
     override fun tick(): Boolean {
+        val permit = tryReserve() ?: return false
+        permit.markSubmitted()
+        return true
+    }
+
+    fun reserveBlockingUntil(deadline: Long): Permit? {
         while (true) {
-            val curSum = sum.get()
-            if (curSum >= rate) return false
-            if (sum.compareAndSet(curSum, curSum + 1)) {
-                queue.add(Measure(1, System.currentTimeMillis()))
-                return true
-            }
+            val remaining = deadline - System.currentTimeMillis()
+            if (remaining <= 0) return null
+            tryReserve()?.let { return it }
+            Thread.sleep(minOf(10, remaining))
         }
     }
 
-    fun tickBlocking() {
-        while (!tick()) {
-            Thread.sleep(10)
+    private fun tryReserve(): Permit? {
+        while (true) {
+            val current = count.get()
+            if (current >= rate) return null
+            if (count.compareAndSet(current, current + 1)) return Permit()
+        }
+    }
+
+    inner class Permit internal constructor() : AutoCloseable {
+        private val completed = AtomicBoolean(false)
+
+        fun markSubmitted() {
+            check(completed.compareAndSet(false, true)) { "Rate permit already completed" }
+            queue.add(Measure(1, System.currentTimeMillis()))
+        }
+
+        override fun close() {
+            if (completed.compareAndSet(false, true)) count.decrementAndGet()
         }
     }
 
@@ -60,8 +78,8 @@ class SlidingWindowRateLimiter(
                 delay(head.timestamp - winStart)
                 continue
             }
-            sum.addAndGet(-1)
             queue.take()
+            count.decrementAndGet()
         }
     }.invokeOnCompletion { th -> if (th != null) logger.error("Rate limiter release job completed", th) }
     companion object {
