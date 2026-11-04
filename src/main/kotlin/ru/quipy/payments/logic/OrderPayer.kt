@@ -36,9 +36,12 @@ class OrderPayer {
         CallerBlockingRejectedExecutionHandler()
     )
 
+    fun tryReserve(deadline: Long) = paymentService.tryReserve(deadline)
+
+    fun releaseReservation() = paymentService.releaseReservation()
+
     fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long {
         val createdAt = System.currentTimeMillis()
-        paymentService.tryReserve(deadline)?.let { throw TooManyRequestsException(it) }
         paymentExecutor.submit {
             try {
                 val createdEvent = paymentESService.create {
@@ -58,5 +61,3 @@ class OrderPayer {
         return createdAt
     }
 }
-
-class TooManyRequestsException(val retryAfter: Long) : RuntimeException()

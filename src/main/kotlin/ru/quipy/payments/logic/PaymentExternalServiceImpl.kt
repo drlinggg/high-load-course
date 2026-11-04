@@ -10,14 +10,16 @@ import okhttp3.Request
 import okhttp3.RequestBody
 import okhttp3.Response
 import org.slf4j.LoggerFactory
+import ru.quipy.common.utils.LeakingBucketRateLimiter
 import ru.quipy.common.utils.OngoingWindow
-import ru.quipy.common.utils.SlidingWindowRateLimiter
+import ru.quipy.common.utils.TokenBucketRateLimiter
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
 import java.io.IOException
 import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 
 
@@ -33,38 +35,46 @@ class PaymentExternalSystemAdapterImpl(
 
         val emptyBody = RequestBody.create(null, ByteArray(0))
         val mapper = ObjectMapper().registerKotlinModule()
-        const val RETRY_AFTER_MILLIS = 50L
     }
 
     private val serviceName = properties.serviceName
     private val accountName = properties.accountName
     private val requestAverageProcessingTime = properties.averageProcessingTime
     private val rateLimitPerSec = properties.rateLimitPerSec
-    private val submissionRate = (rateLimitPerSec * 9 / 10).coerceAtLeast(1)
+    private val submissionRate = rateLimitPerSec.coerceAtLeast(1)
     private val parallelRequests = properties.parallelRequests
     private val pendingPayments = AtomicInteger()
-    private val processingBudgetMillis = requestAverageProcessingTime.toMillis() * 5 / 2
+    private val processingBudgetMillis = requestAverageProcessingTime.toMillis() * 12 / 5
+    private val retryAfterMillis = (1_000L + submissionRate - 1) / submissionRate
+    private val admissionRateLimiter = TokenBucketRateLimiter(
+        submissionRate,
+        parallelRequests,
+        1,
+        TimeUnit.SECONDS
+    )
 
     override fun tryReserve(deadline: Long): Long? {
         val now = now()
-        val maxPending = (deadline - now - processingBudgetMillis) * submissionRate / 1_000
-        if (maxPending <= 0) {
-            pendingPayments.incrementAndGet()
-            return null
-        }
+        val maxPending = ((deadline - now - processingBudgetMillis) * submissionRate / 1_000).coerceAtLeast(1)
         while (true) {
             val pending = pendingPayments.get()
-            if (pending.toLong() >= maxPending) return now + RETRY_AFTER_MILLIS
-            if (pendingPayments.compareAndSet(pending, pending + 1)) return null
+            if (pending.toLong() >= maxPending) return now + retryAfterMillis
+            if (pendingPayments.compareAndSet(pending, pending + 1)) break
         }
+        if (admissionRateLimiter.tick()) return null
+        pendingPayments.decrementAndGet()
+        return now + retryAfterMillis
     }
 
     override fun releaseReservation() {
         pendingPayments.decrementAndGet()
     }
 
-    private val rateLimiter = SlidingWindowRateLimiter(submissionRate.toLong(), Duration.ofSeconds(1))
-
+    private val rateLimiter = LeakingBucketRateLimiter(
+        submissionRate.toLong(),
+        Duration.ofSeconds(1),
+        parallelRequests
+    )
     private val window = OngoingWindow(parallelRequests)
 
     private val client = OkHttpClient.Builder()
@@ -96,8 +106,7 @@ class PaymentExternalSystemAdapterImpl(
         }
 
         val latestSubmissionAt = deadline - avgProcessingMs
-        val ratePermit = rateLimiter.reserveBlockingUntil(latestSubmissionAt)
-        if (ratePermit == null) {
+        if (!rateLimiter.reserveBlockingUntil(latestSubmissionAt)) {
             paymentESService.update(paymentId) {
                 it.logProcessing(false, now(), transactionId, reason = "Deadline exceeded waiting for rate permit")
             }
@@ -127,7 +136,6 @@ class PaymentExternalSystemAdapterImpl(
                 post(emptyBody)
             }.build()
 
-            ratePermit.markSubmitted()
             client.newCall(request).enqueue(object : Callback {
                 override fun onResponse(call: Call, response: Response) {
                     try {
@@ -173,7 +181,6 @@ class PaymentExternalSystemAdapterImpl(
             })
             submitted = true
         } finally {
-            ratePermit.close()
             if (slotAcquired && !submitted) window.release()
         }
     }

@@ -9,7 +9,6 @@ import org.springframework.http.ResponseEntity
 import org.springframework.web.bind.annotation.*
 import ru.quipy.orders.repository.OrderRepository
 import ru.quipy.payments.logic.OrderPayer
-import ru.quipy.payments.logic.TooManyRequestsException
 import java.util.*
 
 @RestController
@@ -60,20 +59,23 @@ class APIController {
 
     @PostMapping("/orders/{orderId}/payment")
     fun payOrder(@PathVariable orderId: UUID, @RequestParam deadline: Long): ResponseEntity<PaymentSubmissionDto> {
+        orderPayer.tryReserve(deadline)?.let {
+            return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS)
+                .header(HttpHeaders.RETRY_AFTER, it.toString())
+                .build()
+        }
+
         val paymentId = UUID.randomUUID()
-        val order = orderRepository.findById(orderId)?.let {
-            orderRepository.save(it.copy(status = OrderStatus.PAYMENT_IN_PROGRESS))
-            it
-        } ?: throw IllegalArgumentException("No such order $orderId")
-
-
         return try {
+            val order = orderRepository.findById(orderId)?.let {
+                orderRepository.save(it.copy(status = OrderStatus.PAYMENT_IN_PROGRESS))
+                it
+            } ?: throw IllegalArgumentException("No such order $orderId")
             val createdAt = orderPayer.processPayment(orderId, order.price, paymentId, deadline)
             ResponseEntity.ok(PaymentSubmissionDto(createdAt, paymentId))
-        } catch (e: TooManyRequestsException) {
-            ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS)
-                .header(HttpHeaders.RETRY_AFTER, e.retryAfter.toString())
-                .build()
+        } catch (e: Exception) {
+            orderPayer.releaseReservation()
+            throw e
         }
     }
 
