@@ -95,7 +95,7 @@ class PaymentExternalSystemAdapterImpl(
 
         logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
 
-        val avgProcessingMs = requestAverageProcessingTime.toMillis()
+        val avgProcessingMs = requestAverageProcessingTime.toMillis() * 2
 
         if (now() + avgProcessingMs > deadline) {
             logger.warn("[$accountName] Skip before throttle, deadline would be missed. payment: $paymentId")
