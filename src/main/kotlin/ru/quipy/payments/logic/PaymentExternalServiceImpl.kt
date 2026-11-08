@@ -45,7 +45,7 @@ class PaymentExternalSystemAdapterImpl(
     private val submissionRate = rateLimitPerSec.coerceAtLeast(1)
     private val parallelRequests = properties.parallelRequests
     private val pendingPayments = AtomicInteger()
-    private val processingBudgetMillis = requestAverageProcessingTime.toMillis() * 12 / 5
+    private val processingBudgetMillis = requestAverageProcessingTime.toMillis()
     private val retryAfterMillis = (1_000L + submissionRate - 1) / submissionRate
     private val admissionRateLimiter = TokenBucketRateLimiter(
         submissionRate,
