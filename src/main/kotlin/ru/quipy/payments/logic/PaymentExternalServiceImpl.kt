@@ -35,6 +35,7 @@ class PaymentExternalSystemAdapterImpl(
 
         val emptyBody = RequestBody.create(null, ByteArray(0))
         val mapper = ObjectMapper().registerKotlinModule()
+        const val MAX_ATTEMPTS = 3
     }
 
     private val serviceName = properties.serviceName
@@ -85,6 +86,16 @@ class PaymentExternalSystemAdapterImpl(
         .build()
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
+        performPaymentAttempt(paymentId, amount, paymentStartedAt, deadline, 1)
+    }
+
+    private fun performPaymentAttempt(
+        paymentId: UUID,
+        amount: Int,
+        paymentStartedAt: Long,
+        deadline: Long,
+        attempt: Int,
+    ) {
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
 
         val transactionId = UUID.randomUUID()
@@ -138,6 +149,7 @@ class PaymentExternalSystemAdapterImpl(
 
             client.newCall(request).enqueue(object : Callback {
                 override fun onResponse(call: Call, response: Response) {
+                    var retry = false
                     try {
                         val body = try {
                             mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
@@ -148,35 +160,35 @@ class PaymentExternalSystemAdapterImpl(
 
                         logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
 
-                        paymentESService.update(paymentId) {
-                            it.logProcessing(body.result, now(), transactionId, reason = body.message)
+                        retry = !body.result &&
+                            (body.message == "Temporary error" || response.code == 429 || response.code >= 500) &&
+                            canRetry(attempt, deadline)
+                        if (!retry) {
+                            paymentESService.update(paymentId) {
+                                it.logProcessing(body.result, now(), transactionId, reason = body.message)
+                            }
                         }
                     } finally {
                         response.close()
                         window.release()
                     }
+                    if (retry) performPaymentAttempt(paymentId, amount, paymentStartedAt, deadline, attempt + 1)
                 }
 
                 override fun onFailure(call: Call, e: IOException) {
+                    val retry = canRetry(attempt, deadline)
                     try {
-                        when (e) {
-                            is SocketTimeoutException -> {
-                                logger.error("[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId", e)
-                                paymentESService.update(paymentId) {
-                                    it.logProcessing(false, now(), transactionId, reason = "Request timeout.")
-                                }
-                            }
-
-                            else -> {
-                                logger.error("[$accountName] Payment failed for txId: $transactionId, payment: $paymentId", e)
-                                paymentESService.update(paymentId) {
-                                    it.logProcessing(false, now(), transactionId, reason = e.message)
-                                }
+                        if (!retry) {
+                            val reason = if (e is SocketTimeoutException) "Request timeout." else e.message
+                            logger.error("[$accountName] Payment failed for txId: $transactionId, payment: $paymentId", e)
+                            paymentESService.update(paymentId) {
+                                it.logProcessing(false, now(), transactionId, reason = reason)
                             }
                         }
                     } finally {
                         window.release()
                     }
+                    if (retry) performPaymentAttempt(paymentId, amount, paymentStartedAt, deadline, attempt + 1)
                 }
             })
             submitted = true
@@ -184,6 +196,9 @@ class PaymentExternalSystemAdapterImpl(
             if (slotAcquired && !submitted) window.release()
         }
     }
+
+    private fun canRetry(attempt: Int, deadline: Long): Boolean =
+        attempt < MAX_ATTEMPTS && now() + requestAverageProcessingTime.toMillis() < deadline
 
     override fun price() = properties.price
 
