@@ -12,6 +12,7 @@ import okhttp3.Response
 import org.slf4j.LoggerFactory
 import ru.quipy.common.utils.LeakingBucketRateLimiter
 import ru.quipy.common.utils.OngoingWindow
+import ru.quipy.common.utils.SlidingWindowRateLimiter
 import ru.quipy.common.utils.TokenBucketRateLimiter
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
@@ -19,6 +20,7 @@ import java.io.IOException
 import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 
@@ -45,6 +47,11 @@ class PaymentExternalSystemAdapterImpl(
     private val parallelRequests = properties.parallelRequests
     private val pendingPayments = AtomicInteger()
     private val processingBudgetMillis = requestAverageProcessingTime.toMillis()
+    private val providerTailMillis = processingBudgetMillis * 2
+    private val shortDeadlineMillis = 3_000L
+    private val shortDispatchBudgetMillis = 100L
+    private val dispatchRateLimiter = SlidingWindowRateLimiter(submissionRate.toLong(), Duration.ofMillis(1_025))
+    private val shortReservations = ConcurrentHashMap<UUID, SlidingWindowRateLimiter.Permit>()
     private val retryAfterMillis = (1_000L + submissionRate - 1) / submissionRate
     private val admissionRateLimiter = TokenBucketRateLimiter(
         submissionRate,
@@ -53,8 +60,27 @@ class PaymentExternalSystemAdapterImpl(
         TimeUnit.SECONDS
     )
 
-    override fun tryReserve(deadline: Long): Long? {
+    override fun tryReserve(paymentId: UUID, deadline: Long): Long? {
         val now = now()
+        if (deadline - now <= shortDeadlineMillis) {
+            if (deadline - now < providerTailMillis + shortDispatchBudgetMillis) return now
+            if (!window.tryAcquire(0)) return now
+
+            val permit = try {
+                dispatchRateLimiter.reserveBlockingUntil(now() + 1)
+            } catch (e: InterruptedException) {
+                window.release()
+                throw e
+            }
+            if (permit == null) {
+                window.release()
+                return now
+            }
+
+            shortReservations[paymentId] = permit
+            pendingPayments.incrementAndGet()
+            return null
+        }
         val maxPending = ((deadline - now - processingBudgetMillis) * submissionRate / 1_000).coerceAtLeast(1)
         while (true) {
             val pending = pendingPayments.get()
@@ -66,7 +92,11 @@ class PaymentExternalSystemAdapterImpl(
         return now + retryAfterMillis
     }
 
-    override fun releaseReservation() {
+    override fun releaseReservation(paymentId: UUID) {
+        shortReservations.remove(paymentId)?.let {
+            it.close()
+            window.release()
+        }
         pendingPayments.decrementAndGet()
     }
 
@@ -85,46 +115,56 @@ class PaymentExternalSystemAdapterImpl(
         .build()
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
-        logger.warn("[$accountName] Submitting payment request for payment $paymentId")
-
-        val transactionId = UUID.randomUUID()
-
-        paymentESService.update(paymentId) {
-            it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
-        }
-
-        logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
-
-        val avgProcessingMs = requestAverageProcessingTime.toMillis() * 2
-
-        if (now() + avgProcessingMs > deadline) {
-            logger.warn("[$accountName] Skip before throttle, deadline would be missed. payment: $paymentId")
-            paymentESService.update(paymentId) {
-                it.logProcessing(false, now(), transactionId, reason = "Deadline exceeded before submit")
-            }
-            return
-        }
-
-        val latestSubmissionAt = deadline - avgProcessingMs
-        if (!rateLimiter.reserveBlockingUntil(latestSubmissionAt)) {
-            paymentESService.update(paymentId) {
-                it.logProcessing(false, now(), transactionId, reason = "Deadline exceeded waiting for rate permit")
-            }
-            return
-        }
-
-        var slotAcquired = false
+        val reservedPermit = shortReservations.remove(paymentId)
+        var dispatchPermit = reservedPermit
+        var slotAcquired = reservedPermit != null
         var submitted = false
+        val transactionId = UUID.randomUUID()
+        val latestSubmissionAt = deadline - providerTailMillis
+
         try {
-            if (!window.tryAcquire(latestSubmissionAt - now())) {
+            logger.warn("[$accountName] Submitting payment request for payment $paymentId")
+
+            paymentESService.update(paymentId) {
+                it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
+            }
+
+            logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
+
+            if (now() > latestSubmissionAt) {
+                logger.warn("[$accountName] Skip before throttle, deadline would be missed. payment: $paymentId")
                 paymentESService.update(paymentId) {
-                    it.logProcessing(false, now(), transactionId, reason = "Deadline exceeded waiting for concurrent request slot")
+                    it.logProcessing(false, now(), transactionId, reason = "Deadline exceeded before submit")
                 }
                 return
             }
-            slotAcquired = true
 
-            if (now() + avgProcessingMs > deadline) {
+            if (reservedPermit == null) {
+                if (!rateLimiter.reserveBlockingUntil(latestSubmissionAt)) {
+                    paymentESService.update(paymentId) {
+                        it.logProcessing(false, now(), transactionId, reason = "Deadline exceeded waiting for rate permit")
+                    }
+                    return
+                }
+
+                if (!window.tryAcquire(latestSubmissionAt - now())) {
+                    paymentESService.update(paymentId) {
+                        it.logProcessing(false, now(), transactionId, reason = "Deadline exceeded waiting for concurrent request slot")
+                    }
+                    return
+                }
+                slotAcquired = true
+
+                dispatchPermit = dispatchRateLimiter.reserveBlockingUntil(latestSubmissionAt)
+                if (dispatchPermit == null) {
+                    paymentESService.update(paymentId) {
+                        it.logProcessing(false, now(), transactionId, reason = "Deadline exceeded waiting for rate permit")
+                    }
+                    return
+                }
+            }
+
+            if (now() > latestSubmissionAt) {
                 paymentESService.update(paymentId) {
                     it.logProcessing(false, now(), transactionId, reason = "Deadline exceeded before HTTP submit")
                 }
@@ -136,6 +176,7 @@ class PaymentExternalSystemAdapterImpl(
                 post(emptyBody)
             }.build()
 
+            dispatchPermit.markSubmitted()
             client.newCall(request).enqueue(object : Callback {
                 override fun onResponse(call: Call, response: Response) {
                     try {
@@ -181,6 +222,7 @@ class PaymentExternalSystemAdapterImpl(
             })
             submitted = true
         } finally {
+            dispatchPermit?.close()
             if (slotAcquired && !submitted) window.release()
         }
     }
