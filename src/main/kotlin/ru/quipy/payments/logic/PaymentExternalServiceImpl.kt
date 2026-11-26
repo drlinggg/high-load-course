@@ -3,29 +3,28 @@ package ru.quipy.payments.logic
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
 import io.micrometer.core.instrument.MeterRegistry
-import io.micrometer.core.instrument.Tag
 import okhttp3.Call
 import okhttp3.Callback
 import okhttp3.Dispatcher
-import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
-import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.RequestBody
 import okhttp3.Response
 import org.slf4j.LoggerFactory
-import ru.quipy.common.utils.NamedThreadFactory
+import ru.quipy.common.utils.LeakingBucketRateLimiter
 import ru.quipy.common.utils.OngoingWindow
 import ru.quipy.common.utils.SlidingWindowRateLimiter
+import ru.quipy.common.utils.TokenBucketRateLimiter
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
 import java.io.IOException
 import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 
-import java.util.concurrent.Executors
-import java.util.concurrent.LinkedBlockingQueue
 
 class PaymentExternalSystemAdapterImpl(
     private val properties: PaymentAccountProperties,
@@ -38,171 +37,212 @@ class PaymentExternalSystemAdapterImpl(
     companion object {
         val logger = LoggerFactory.getLogger(PaymentExternalSystemAdapter::class.java)
 
+        val emptyBody = RequestBody.create(null, ByteArray(0))
         val mapper = ObjectMapper().registerKotlinModule()
-        const val RETRY_AFTER_MILLIS = 50L
-        val json = "application/json".toMediaType()
     }
-
-    private data class PendingPayment(
-        val paymentId: UUID,
-        val transactionId: UUID,
-        val amount: Int,
-        val deadline: Long,
-    )
 
     private val serviceName = properties.serviceName
     private val accountName = properties.accountName
     private val requestAverageProcessingTime = properties.averageProcessingTime
     private val rateLimitPerSec = properties.rateLimitPerSec
-    private val submissionRate = (rateLimitPerSec * 9 / 10).coerceAtLeast(1)
+    private val submissionRate = rateLimitPerSec.coerceAtLeast(1)
     private val parallelRequests = properties.parallelRequests
     private val pendingPayments = AtomicInteger()
-    private val processingBudgetMillis = requestAverageProcessingTime.toMillis() * 5 / 2
+    private val processingBudgetMillis = requestAverageProcessingTime.toMillis()
+    private val shortProviderTailMillis = processingBudgetMillis + 500
+    private val providerTailMillis = processingBudgetMillis * 2
+    private val burstProviderTailMillis = processingBudgetMillis * 3
+    private val shortDeadlineMillis = 3_000L
+    private val burstDeadlineMillis = 20_000L
+    private val burstQueueBudgetMillis = 20_000L
+    private val burstQueueCapacity = submissionRate * burstQueueBudgetMillis / 1_000
+    private val shortQueueCapacity = submissionRate
+    private val dispatchRateLimiter = SlidingWindowRateLimiter(submissionRate.toLong(), Duration.ofMillis(1_025))
+    private val retryAfterMillis = (1_000L + submissionRate - 1) / submissionRate
+    private val nextRetryAt = AtomicLong()
+    private val admissionRateLimiter = TokenBucketRateLimiter(
+        submissionRate,
+        parallelRequests,
+        1,
+        TimeUnit.SECONDS
+    )
 
-    override fun tryReserve(deadline: Long): Long? {
+    override fun tryReserve(paymentId: UUID, deadline: Long): Long? {
         val now = now()
-        val maxPending = (deadline - now - processingBudgetMillis) * submissionRate / 1_000
-        if (maxPending <= 0) {
-            pendingPayments.incrementAndGet()
-            return null
+        if (deadline - now <= shortDeadlineMillis) {
+            val maxPending = ((deadline - now - shortProviderTailMillis) * submissionRate / 1_000)
+                .coerceIn(0L, shortQueueCapacity.toLong())
+            while (true) {
+                val pending = pendingPayments.get()
+                if (pending.toLong() >= maxPending) return shortRetryAt(paymentId, now)
+                if (pendingPayments.compareAndSet(pending, pending + 1)) return null
+            }
+        }
+        val processingReserve = if (deadline - now >= burstDeadlineMillis) burstProviderTailMillis else providerTailMillis
+        val deadlineCapacity = ((deadline - now - processingReserve) * submissionRate / 1_000).coerceAtLeast(1)
+        val maxPending = if (deadline - now >= burstDeadlineMillis) {
+            minOf(deadlineCapacity, burstQueueCapacity)
+        } else {
+            deadlineCapacity
         }
         while (true) {
             val pending = pendingPayments.get()
-            if (pending.toLong() >= maxPending) return now + 
-            if (pendingPayments.compareAndSet(pending, pending + 1)) return null
+            if (pending.toLong() >= maxPending) return reserveRetryAt(now)
+            if (pendingPayments.compareAndSet(pending, pending + 1)) break
+        }
+        if (deadline - now >= burstDeadlineMillis || admissionRateLimiter.tick()) return null
+        pendingPayments.decrementAndGet()
+        return reserveRetryAt(now)
+    }
+
+    private fun reserveRetryAt(now: Long, earliest: Long = now + retryAfterMillis): Long {
+        while (true) {
+            val current = nextRetryAt.get()
+            val retryAt = maxOf(earliest, current)
+            if (nextRetryAt.compareAndSet(current, retryAt + retryAfterMillis)) return retryAt
         }
     }
 
-    override fun releaseReservation() {
+    private fun shortRetryAt(paymentId: UUID, now: Long): Long {
+        val slot = Math.floorMod(paymentId.hashCode(), submissionRate)
+        val jitterStepMillis = maxOf(10L, retryAfterMillis / 4)
+        return now + jitterStepMillis * (slot + 1L)
+    }
+
+    override fun releaseReservation(paymentId: UUID) {
         pendingPayments.decrementAndGet()
     }
 
-    private val rateLimiter = SlidingWindowRateLimiter(submissionRate.toLong(), Duration.ofSeconds(1))
-
+    private val rateLimiter = LeakingBucketRateLimiter(
+        submissionRate.toLong(),
+        Duration.ofSeconds(1),
+        parallelRequests
+    )
     private val window = OngoingWindow(parallelRequests)
-
-    private val pendingPayments = LinkedBlockingQueue<PendingPayment>()
 
     private val client = OkHttpClient.Builder()
         .dispatcher(Dispatcher().apply {
             maxRequests = parallelRequests
             maxRequestsPerHost = parallelRequests
         })
-        .readTimeout(Duration.ofMinutes(1))
         .build()
 
-    init {
-        meterRegistry.gauge(
-            "payment_batch_queue_size",
-            listOf(Tag.of("account", accountName)),
-            pendingPayments,
-        ) { it.size.toDouble() }
-        Executors.newSingleThreadExecutor(NamedThreadFactory("payment-batch-$accountName"))
-            .submit { processQueue() }
-    }
-
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
-        logger.warn("[$accountName] Submitting payment request for payment $paymentId")
-
+        var dispatchPermit: SlidingWindowRateLimiter.Permit? = null
+        var slotAcquired = false
+        var submitted = false
         val transactionId = UUID.randomUUID()
-
-        paymentESService.update(paymentId) {
-            it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
+        val burstMode = deadline - paymentStartedAt >= burstDeadlineMillis
+        val shortMode = deadline - paymentStartedAt <= shortDeadlineMillis
+        val processingReserve = when {
+            burstMode -> burstProviderTailMillis
+            shortMode -> shortProviderTailMillis
+            else -> providerTailMillis
         }
+        val latestSubmissionAt = deadline - processingReserve
 
-        logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
+        try {
+            logger.warn("[$accountName] Submitting payment request for payment $paymentId")
 
-        pendingPayments.put(PendingPayment(paymentId, transactionId, amount, deadline))
-    }
-
-    private fun processQueue() {
-        while (!Thread.currentThread().isInterrupted) {
-            val first = pendingPayments.take()
-            val latestSubmissionAt = first.deadline - requestAverageProcessingTime.toMillis()
-            val ratePermit = rateLimiter.reserveBlockingUntil(latestSubmissionAt)
-            if (ratePermit == null) {
-                fail(first, "Deadline exceeded waiting for rate permit")
-                continue
+            paymentESService.update(paymentId) {
+                it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
             }
 
-            var slotAcquired = false
-            var submitted = false
-            try {
-                if (!window.tryAcquire(latestSubmissionAt - now())) {
-                    fail(first, "Deadline exceeded waiting for concurrent request slot")
-                    continue
+            logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
+
+            if (now() > latestSubmissionAt) {
+                logger.warn("[$accountName] Skip before throttle, deadline would be missed. payment: $paymentId")
+                paymentESService.update(paymentId) {
+                    it.logProcessing(false, now(), transactionId, reason = "Deadline exceeded before submit")
                 }
-                slotAcquired = true
+                return
+            }
 
-                val batch = mutableListOf(first)
-                pendingPayments.drainTo(batch)
-                val validBatch = batch.filter {
-                    val valid = now() + requestAverageProcessingTime.toMillis() <= it.deadline
-                    if (!valid) fail(it, "Deadline exceeded before HTTP submit")
-                    valid
+            if (burstMode || shortMode) {
+                dispatchPermit = dispatchRateLimiter.reserveBlockingUntil(latestSubmissionAt)
+                if (dispatchPermit == null) {
+                    paymentESService.update(paymentId) {
+                        it.logProcessing(false, now(), transactionId, reason = "Deadline exceeded waiting for rate permit")
+                    }
+                    return
                 }
-                if (validBatch.isEmpty()) continue
-
-                val timeout = Duration.ofMillis((validBatch.minOf { it.deadline } - now()).coerceAtLeast(1))
-                val body = ExternalSysBulkRequest(
-                    serviceName,
-                    accountName,
-                    validBatch.map {
-                        ExternalSysPaymentRequest(it.transactionId.toString(), it.paymentId.toString(), it.amount)
-                    },
-                )
-                val request = Request.Builder()
-                    .url("http://$paymentProviderHostPort/external/process/bulk?token=$token&timeout=$timeout")
-                    .put(mapper.writeValueAsBytes(body).toRequestBody(json))
-                    .build()
-
-                ratePermit.markSubmitted()
-                client.newCall(request).enqueue(batchCallback(validBatch))
-                submitted = true
-            } finally {
-                ratePermit.close()
-                if (slotAcquired && !submitted) window.release()
-            }
-        }
-    }
-
-    private fun batchCallback(batch: List<PendingPayment>) = object : Callback {
-        override fun onResponse(call: Call, response: Response) {
-            val results = try {
-                mapper.readValue(response.body?.string(), ExternalSysBulkResponse::class.java).responses
-                    .associateBy { it.transactionId }
-            } catch (e: Exception) {
-                logger.error("[$accountName] Could not read bulk payment response, result code: ${response.code}", e)
-                emptyMap()
-            } finally {
-                response.close()
-                window.release()
-            }
-
-            batch.forEach { payment ->
-                val result = results[payment.transactionId.toString()]
-                paymentESService.update(payment.paymentId) {
-                    it.logProcessing(
-                        result?.result == true,
-                        now(),
-                        payment.transactionId,
-                        reason = if (result == null) "Missing bulk response" else result.message,
-                    )
+            } else {
+                if (!rateLimiter.reserveBlockingUntil(latestSubmissionAt)) {
+                    paymentESService.update(paymentId) {
+                        it.logProcessing(false, now(), transactionId, reason = "Deadline exceeded waiting for rate permit")
+                    }
+                    return
                 }
             }
-        }
 
-        override fun onFailure(call: Call, e: IOException) {
-            window.release()
-            val reason = if (e is SocketTimeoutException) "Request timeout." else e.message
-            logger.error("[$accountName] Bulk payment request failed", e)
-            batch.forEach { fail(it, reason) }
-        }
-    }
+            if (!window.tryAcquire(latestSubmissionAt - now())) {
+                paymentESService.update(paymentId) {
+                    it.logProcessing(false, now(), transactionId, reason = "Deadline exceeded waiting for concurrent request slot")
+                }
+                return
+            }
+            slotAcquired = true
 
-    private fun fail(payment: PendingPayment, reason: String?) {
-        paymentESService.update(payment.paymentId) {
-            it.logProcessing(false, now(), payment.transactionId, reason = reason)
+            if (now() > latestSubmissionAt) {
+                paymentESService.update(paymentId) {
+                    it.logProcessing(false, now(), transactionId, reason = "Deadline exceeded before HTTP submit")
+                }
+                return
+            }
+
+            val request = Request.Builder().run {
+                url("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
+                post(emptyBody)
+            }.build()
+
+            dispatchPermit?.markSubmitted()
+            client.newCall(request).enqueue(object : Callback {
+                override fun onResponse(call: Call, response: Response) {
+                    try {
+                        val body = try {
+                            mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
+                        } catch (e: Exception) {
+                            logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.code}")
+                            ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
+                        }
+
+                        logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
+
+                        paymentESService.update(paymentId) {
+                            it.logProcessing(body.result, now(), transactionId, reason = body.message)
+                        }
+                    } finally {
+                        response.close()
+                        window.release()
+                    }
+                }
+
+                override fun onFailure(call: Call, e: IOException) {
+                    try {
+                        when (e) {
+                            is SocketTimeoutException -> {
+                                logger.error("[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId", e)
+                                paymentESService.update(paymentId) {
+                                    it.logProcessing(false, now(), transactionId, reason = "Request timeout.")
+                                }
+                            }
+
+                            else -> {
+                                logger.error("[$accountName] Payment failed for txId: $transactionId, payment: $paymentId", e)
+                                paymentESService.update(paymentId) {
+                                    it.logProcessing(false, now(), transactionId, reason = e.message)
+                                }
+                            }
+                        }
+                    } finally {
+                        window.release()
+                    }
+                }
+            })
+            submitted = true
+        } finally {
+            dispatchPermit?.close()
+            if (slotAcquired && !submitted) window.release()
         }
     }
 
