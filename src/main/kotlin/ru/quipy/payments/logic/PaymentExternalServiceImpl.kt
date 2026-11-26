@@ -2,6 +2,8 @@ package ru.quipy.payments.logic
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
+import io.micrometer.core.instrument.Counter
+import io.micrometer.core.instrument.DistributionSummary
 import io.micrometer.core.instrument.MeterRegistry
 import okhttp3.Call
 import okhttp3.Callback
@@ -50,6 +52,11 @@ class PaymentExternalSystemAdapterImpl(
     private val parallelRequests = properties.parallelRequests
     private val pendingPayments = AtomicInteger()
     private val processingBudgetMillis = requestAverageProcessingTime.toMillis()
+    private val requestTimeoutMillis = when (accountName) {
+        "acc-7" -> processingBudgetMillis * 3 / 2
+        else -> processingBudgetMillis * 2
+    }
+    private val clientTimeoutMillis = requestTimeoutMillis + 250
     private val shortProviderTailMillis = processingBudgetMillis + 500
     private val providerTailMillis = processingBudgetMillis * 2
     private val burstProviderTailMillis = processingBudgetMillis * 3
@@ -67,6 +74,23 @@ class PaymentExternalSystemAdapterImpl(
         1,
         TimeUnit.SECONDS
     )
+    private val requestLatency = DistributionSummary.builder("payment_external_request_duration_milliseconds")
+        .description("External payment request duration")
+        .baseUnit("milliseconds")
+        .minimumExpectedValue(1.0)
+        .maximumExpectedValue(requestTimeoutMillis.toDouble())
+        .publishPercentiles(0.5, 0.85, 0.9, 0.95, 0.99)
+        .publishPercentileHistogram()
+        .tags("service", serviceName, "accountName", accountName)
+        .register(meterRegistry)
+    private val retryCounter = Counter.builder("payment_external_retries")
+        .description("External payment retries")
+        .tags("service", serviceName, "accountName", accountName)
+        .register(meterRegistry)
+    private val timeoutCounter = Counter.builder("payment_external_timeouts")
+        .description("External payment call timeouts")
+        .tags("service", serviceName, "accountName", accountName)
+        .register(meterRegistry)
 
     override fun tryReserve(paymentId: UUID, deadline: Long): Long? {
         val now = now()
@@ -122,6 +146,9 @@ class PaymentExternalSystemAdapterImpl(
     private val window = OngoingWindow(parallelRequests)
 
     private val client = OkHttpClient.Builder()
+        .connectTimeout(minOf(1_000L, requestTimeoutMillis), TimeUnit.MILLISECONDS)
+        .readTimeout(clientTimeoutMillis, TimeUnit.MILLISECONDS)
+        .writeTimeout(minOf(1_000L, requestTimeoutMillis), TimeUnit.MILLISECONDS)
         .dispatcher(Dispatcher().apply {
             maxRequests = parallelRequests
             maxRequestsPerHost = parallelRequests
@@ -202,12 +229,22 @@ class PaymentExternalSystemAdapterImpl(
             }
 
             val request = Request.Builder().run {
-                url("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
+                url("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount&timeout=${Duration.ofMillis(requestTimeoutMillis)}")
                 post(emptyBody)
             }.build()
 
+            val requestStartedAt = now()
+            val call = client.newCall(request)
+            val callTimeoutMillis = minOf(clientTimeoutMillis, deadline - requestStartedAt)
+            if (callTimeoutMillis <= 0) {
+                paymentESService.update(paymentId) {
+                    it.logProcessing(false, now(), transactionId, reason = "Deadline exceeded before HTTP call")
+                }
+                return
+            }
+            call.timeout().timeout(callTimeoutMillis, TimeUnit.MILLISECONDS)
             dispatchPermit?.markSubmitted()
-            client.newCall(request).enqueue(object : Callback {
+            call.enqueue(object : Callback {
                 override fun onResponse(call: Call, response: Response) {
                     var retry = false
                     try {
@@ -221,23 +258,26 @@ class PaymentExternalSystemAdapterImpl(
                         logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
 
                         retry = !body.result &&
-                            (body.message == "Temporary error" || response.code == 429 || response.code >= 500) &&
+                            (body.message == "Temporary error" || body.message == "Timeout" || response.code == 408 || response.code == 429 || response.code >= 500) &&
                             canRetry(attempt, deadline)
+                        if (body.message == "Timeout" || response.code == 408) timeoutCounter.increment()
                         if (!retry) {
                             paymentESService.update(paymentId) {
                                 it.logProcessing(body.result, now(), transactionId, reason = body.message)
                             }
                         }
                     } finally {
+                        requestLatency.record((now() - requestStartedAt).toDouble())
                         response.close()
                         window.release()
                     }
-                    if (retry) performPaymentAttempt(paymentId, amount, paymentStartedAt, deadline, attempt + 1)
+                    if (retry) retry(paymentId, amount, paymentStartedAt, deadline, attempt)
                 }
 
                 override fun onFailure(call: Call, e: IOException) {
                     val retry = canRetry(attempt, deadline)
                     try {
+                        if (e is SocketTimeoutException || call.isCanceled()) timeoutCounter.increment()
                         if (!retry) {
                             val reason = if (e is SocketTimeoutException) "Request timeout." else e.message
                             logger.error("[$accountName] Payment failed for txId: $transactionId, payment: $paymentId", e)
@@ -246,9 +286,10 @@ class PaymentExternalSystemAdapterImpl(
                             }
                         }
                     } finally {
+                        requestLatency.record((now() - requestStartedAt).toDouble())
                         window.release()
                     }
-                    if (retry) performPaymentAttempt(paymentId, amount, paymentStartedAt, deadline, attempt + 1)
+                    if (retry) retry(paymentId, amount, paymentStartedAt, deadline, attempt)
                 }
             })
             submitted = true
@@ -256,6 +297,11 @@ class PaymentExternalSystemAdapterImpl(
             dispatchPermit?.close()
             if (slotAcquired && !submitted) window.release()
         }
+    }
+
+    private fun retry(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long, attempt: Int) {
+        retryCounter.increment()
+        performPaymentAttempt(paymentId, amount, paymentStartedAt, deadline, attempt + 1)
     }
 
     private fun canRetry(attempt: Int, deadline: Long): Boolean =
